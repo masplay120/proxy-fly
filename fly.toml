@@ -1,19 +1,17 @@
 app = "masplay-streamingtv"
-primary_region = "mia"  # o tu región preferida
+primary_region = "mia"
 
 [build]
   dockerfile = "Dockerfile"
 
 [env]
   PORT = "8080"
+  ADMIN_USER = "admin"
+  ADMIN_PASS = "1234"
 
 [[services]]
   internal_port = 8080
   protocol = "tcp"
-
-  [services.concurrency]
-    hard_limit = 25
-    soft_limit = 20
 
   [[services.ports]]
     handlers = ["http"]
@@ -22,7 +20,3 @@ primary_region = "mia"  # o tu región preferida
   [[services.ports]]
     handlers = ["tls", "http"]
     port = 443
-
-  [[services.tcp_checks]]
-    interval = "15s"
-    timeout = "2s"
