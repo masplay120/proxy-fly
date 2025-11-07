@@ -33,7 +33,6 @@ app.use("/admin", (req, res, next) => {
 const CHANNELS_PATH = path.join(process.cwd(), "channels.json");
 let channels = JSON.parse(fs.readFileSync(CHANNELS_PATH, "utf8"));
 
-// Inicializa objetos por canal
 const channelStatus = {};
 const PLAYLIST_CACHE = {};
 for (const ch in channels) {
@@ -44,8 +43,8 @@ for (const ch in channels) {
 // =============================
 // 👥 CONEXIONES ACTIVAS
 // =============================
-const conexionesActivas = {}; // { canal: { "ip|ua": { dispositivo, ultimaVez } } }
-const TTL = 30000; // 30s timeout por usuario
+const conexionesActivas = {};
+const TTL = 30000;
 
 function detectarDispositivo(userAgent) {
   userAgent = userAgent.toLowerCase();
@@ -64,7 +63,7 @@ function registrarConexion(canal, req) {
   conexionesActivas[canal][key] = { dispositivo, ultimaVez: Date.now() };
 }
 
-function limpiarConexiones() {
+setInterval(() => {
   const ahora = Date.now();
   for (const canal in conexionesActivas) {
     for (const key in conexionesActivas[canal]) {
@@ -73,8 +72,7 @@ function limpiarConexiones() {
       }
     }
   }
-}
-setInterval(limpiarConexiones, 10000);
+}, 10000);
 
 function obtenerEstadoCanal(canal) {
   const usuarios = conexionesActivas[canal] || {};
@@ -88,7 +86,7 @@ function obtenerEstadoCanal(canal) {
 }
 
 // =============================
-// 🧠 FUNCION CHECK LIVE
+// 🧠 CHECK LIVE
 // =============================
 async function checkLive(channel) {
   if (!channelStatus[channel]) channelStatus[channel] = { live: false, lastCheck: 0 };
@@ -138,7 +136,7 @@ app.post("/api/channels", (req, res) => {
 // =============================
 // 🎛️ PROXY DE PLAYLIST
 // =============================
-const CACHE_TTL = 10000; // 10s
+const CACHE_TTL = 10000;
 
 app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
   const { channel } = req.params;
@@ -174,10 +172,11 @@ app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
 });
 
 // =============================
-// 🎞️ PROXY DE SEGMENTOS TS (Optimizado para Fly.io)
+// 🎞️ PROXY DE SEGMENTOS TS (Ruta comodín)
 // =============================
-app.get("/proxy/:channel/:segment", async (req, res) => {
-  const { channel, segment } = req.params;
+app.get("/proxy/:channel/*", async (req, res) => {
+  const { channel } = req.params;
+  const segment = req.params[0]; // Captura todo lo que venga después del canal
   const config = channels[channel];
   if (!config) return res.status(404).send("Canal no encontrado");
 
@@ -192,9 +191,7 @@ app.get("/proxy/:channel/:segment", async (req, res) => {
   const segmentUrl = `${urlObj.toString()}${segment}`;
 
   try {
-    const response = await fetch(segmentUrl, {
-      headers: { Range: req.headers.range || "" }
-    });
+    const response = await fetch(segmentUrl, { headers: { Range: req.headers.range || "" } });
 
     if (!response.ok) {
       res.status(response.status).end();
@@ -234,7 +231,7 @@ app.get("/status/:channel", (req, res) => {
 });
 
 // =============================
-// 🚀 INICIO DEL SERVIDOR CON KEEP-ALIVE
+// 🚀 SERVIDOR CON KEEP-ALIVE
 // =============================
 const server = http.createServer(app);
 server.keepAliveTimeout = 65 * 1000;
