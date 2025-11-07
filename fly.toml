@@ -1,5 +1,5 @@
 app = "masplay-streamingtv"
-primary_region = "atl"
+primary_region = "mia"
 
 [build]
   dockerfile = "Dockerfile"
