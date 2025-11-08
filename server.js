@@ -175,7 +175,7 @@ app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
 // 📦 CACHE DE SEGMENTOS EN MEMORIA
 // =============================
 const SEGMENT_CACHE = {}; // { canal: { segmento: { buffer, timestamp } } }
-const SEGMENT_TTL = 30000; // 30s por segmento
+const SEGMENT_TTL = 60000; // 30s por segmento
 
 // =============================
 // 🎞️ PROXY DE SEGMENTOS TS (Ruta comodín con buffer)
