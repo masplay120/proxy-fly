@@ -172,11 +172,17 @@ app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
 });
 
 // =============================
-// 🎞️ PROXY DE SEGMENTOS TS (Ruta comodín)
+// 📦 CACHE DE SEGMENTOS EN MEMORIA
+// =============================
+const SEGMENT_CACHE = {}; // { canal: { segmento: { buffer, timestamp } } }
+const SEGMENT_TTL = 30000; // 30s por segmento
+
+// =============================
+// 🎞️ PROXY DE SEGMENTOS TS (Ruta comodín con buffer)
 // =============================
 app.get("/proxy/:channel/*", async (req, res) => {
   const { channel } = req.params;
-  const segment = req.params[0]; // Captura todo lo que venga después del canal
+  const segment = req.params[0]; 
   const config = channels[channel];
   if (!config) return res.status(404).send("Canal no encontrado");
 
@@ -190,25 +196,32 @@ app.get("/proxy/:channel/*", async (req, res) => {
   urlObj.pathname = urlObj.pathname.substring(0, urlObj.pathname.lastIndexOf("/") + 1);
   const segmentUrl = `${urlObj.toString()}${segment}`;
 
+  if (!SEGMENT_CACHE[channel]) SEGMENT_CACHE[channel] = {};
+  const cached = SEGMENT_CACHE[channel][segment];
+  const now = Date.now();
+
+  if (cached && now - cached.timestamp < SEGMENT_TTL) {
+    res.setHeader("Content-Type", "video/MP2T");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Accept-Ranges", "bytes");
+    res.send(cached.buffer);
+    return;
+  }
+
   try {
     const response = await fetch(segmentUrl, { headers: { Range: req.headers.range || "" } });
-
     if (!response.ok) {
       res.status(response.status).end();
       return;
     }
 
-    for (const [key, value] of response.headers) {
-      if (["content-type", "content-length", "accept-ranges"].includes(key.toLowerCase())) {
-        res.setHeader(key, value);
-      }
-    }
+    const buffer = Buffer.from(await response.arrayBuffer());
+    SEGMENT_CACHE[channel][segment] = { buffer, timestamp: Date.now() };
 
+    res.setHeader("Content-Type", "video/MP2T");
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET,HEAD,OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Range");
-
-    response.body.pipe(res);
+    res.setHeader("Accept-Ranges", "bytes");
+    res.send(buffer);
   } catch (err) {
     console.error("❌ Error proxy TS:", err.message);
     res.status(500).send("Error al retransmitir segmento");
