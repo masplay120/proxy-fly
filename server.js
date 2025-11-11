@@ -28,153 +28,139 @@ app.use((req, res, next) => {
 });
 
 // =============================
-// ⚡ utilidades
+// ⚙️ Configuración
 // =============================
-async function isLive(url) {
+const BUFFER_SEGMENTS = 30; // Mantener 30 segmentos (~3 min)
+const REFRESH_INTERVAL = 5000; // refrescar playlists cada 5s
+const CACHE = new Map(); // key=url, value=Buffer
+const PLAYLISTS = {}; // canal → {segments: [], base: string, lastUpdate: Date}
+
+// =============================
+// 🔁 Actualización periódica
+// =============================
+async function updatePlaylist(channel, config) {
+  const url = config.live || config.cloud;
+  const base = url.substring(0, url.lastIndexOf("/") + 1);
   try {
-    const res = await fetch(url, { method: "HEAD", timeout: 3000 });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("Playlist no disponible");
+    const body = await res.text();
 
-function baseUrlFromM3u8(url) {
-  const u = new URL(url);
-  u.pathname = u.pathname.substring(0, u.pathname.lastIndexOf("/") + 1);
-  return u.toString();
-}
+    const segs = [...body.matchAll(/(.*\.ts.*)/g)].map(m => m[1].trim());
+    if (!segs.length) return;
 
-// =============================
-// 🎛 Proxy playlist con reescritura
-// =============================
-app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
-  const { channel } = req.params;
-  const config = channels[channel];
-  if (!config) return res.status(404).send("Canal no encontrado");
+    if (!PLAYLISTS[channel]) PLAYLISTS[channel] = { segments: [], base };
 
-  const live = await isLive(config.live);
-  const playlistUrl = live ? config.live : config.cloud;
-  const base = baseUrlFromM3u8(playlistUrl);
-
-  try {
-    const response = await fetch(playlistUrl);
-    if (!response.ok) throw new Error("Playlist no disponible");
-
-    let body = await response.text();
-    body = body.replace(/^(?!#)(.*\.ts.*)$/gm, (line) => {
-      const clean = line.trim();
-      return `/proxy/${channel}/${clean}`;
-    });
-
-    // Guardamos últimos segmentos detectados para prefetch
-    const segments = [...body.matchAll(/(.*\.ts.*)/g)].map(m => m[1]);
-    if (segments.length) {
-      prefetchSegments[channel] = {
-        base,
-        list: segments.slice(-3) // últimos 3 segmentos para precargar
-      };
-      triggerPrefetch(channel);
+    const existing = PLAYLISTS[channel].segments;
+    for (const s of segs) {
+      if (!existing.includes(s)) {
+        existing.push(s);
+        if (existing.length > BUFFER_SEGMENTS) existing.shift(); // eliminar antiguos
+      }
     }
 
-    res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-    res.send(body);
-  } catch (e) {
-    console.error(`⚠️ Error cargando playlist de ${channel}:`, e.message);
-    res.status(500).send("Error al cargar playlist");
+    PLAYLISTS[channel].base = base;
+    PLAYLISTS[channel].lastUpdate = new Date();
+
+    // Prefetch de los últimos 5 segmentos
+    const last5 = existing.slice(-5);
+    for (const seg of last5) {
+      const full = base + seg;
+      if (!CACHE.has(full)) fetchSegment(full);
+    }
+
+  } catch (err) {
+    console.warn(`⚠️ Error actualizando ${channel}:`, err.message);
   }
+}
+
+// Descarga y guarda un segmento
+async function fetchSegment(url) {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return;
+    const buf = Buffer.from(await res.arrayBuffer());
+    CACHE.set(url, buf);
+    if (CACHE.size > 60) {
+      const firstKey = CACHE.keys().next().value;
+      CACHE.delete(firstKey);
+    }
+  } catch (err) {
+    console.warn("Prefetch falló:", err.message);
+  }
+}
+
+// Ejecutar actualizaciones cada REFRESH_INTERVAL
+setInterval(() => {
+  for (const [channel, config] of Object.entries(channels)) {
+    updatePlaylist(channel, config);
+  }
+}, REFRESH_INTERVAL);
+
+// =============================
+// 🎞 Proxy de playlist
+// =============================
+app.get("/proxy/:channel/playlist.m3u8", (req, res) => {
+  const { channel } = req.params;
+  const data = PLAYLISTS[channel];
+  if (!data || !data.segments.length)
+    return res.status(503).send("# Esperando buffer...");
+
+  let body = "#EXTM3U\n#EXT-X-VERSION:3\n";
+  body += "#EXT-X-TARGETDURATION:10\n";
+  body += `#EXT-X-MEDIA-SEQUENCE:${Date.now()}\n`;
+
+  for (const seg of data.segments) {
+    body += `#EXTINF:10,\n/proxy/${channel}/${seg}\n`;
+  }
+
+  res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+  res.send(body);
 });
 
 // =============================
-// 📦 Prefetch y caché de segmentos
-// =============================
-const segmentCache = new Map(); // key: url, value: Buffer
-const prefetchSegments = {};    // canal → { base, list }
-const MAX_CACHE = 15;           // máximo 15 segmentos en memoria
-
-async function fetchSegment(url) {
-  if (segmentCache.has(url)) return; // ya en cache
-  try {
-    const res = await fetch(url, { timeout: 10000 });
-    if (res.ok) {
-      const buf = Buffer.from(await res.arrayBuffer());
-      if (segmentCache.size > MAX_CACHE) {
-        const firstKey = segmentCache.keys().next().value;
-        segmentCache.delete(firstKey);
-      }
-      segmentCache.set(url, buf);
-      // console.log("✅ Prefetch", url);
-    }
-  } catch (err) {
-    console.warn("⚠️ Prefetch error:", err.message);
-  }
-}
-
-function triggerPrefetch(channel) {
-  const info = prefetchSegments[channel];
-  if (!info) return;
-  for (const seg of info.list) {
-    const url = info.base + seg;
-    fetchSegment(url);
-  }
-}
-
-// =============================
-// 🎞 Proxy de segmentos con buffer
+// 🎬 Proxy de segmentos
 // =============================
 app.get("/proxy/:channel/*", async (req, res) => {
   const { channel } = req.params;
-  const segment = req.params[0];
-  const config = channels[channel];
-  if (!config) return res.status(404).send("Canal no encontrado");
+  const seg = req.params[0];
+  const data = PLAYLISTS[channel];
+  if (!data) return res.status(404).send("Canal no encontrado");
 
-  const live = await isLive(config.live);
-  const base = baseUrlFromM3u8(live ? config.live : config.cloud);
-  const url = base + segment;
+  const full = data.base + seg;
+  const cached = CACHE.get(full);
+  res.setHeader("Content-Type", "video/MP2T");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Connection", "keep-alive");
 
-  // ¿Ya está en caché?
-  const cached = segmentCache.get(url);
   if (cached) {
-    res.setHeader("Content-Type", "video/MP2T");
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Connection", "keep-alive");
     res.end(cached);
-    return;
-  }
-
-  // Si no, descargar y servir en streaming
-  try {
-    const response = await fetch(url, { timeout: 15000 });
-    if (!response.ok || !response.body) {
-      res.status(response.status).end();
-      return;
-    }
-
-    const chunks = [];
-    response.body.on("data", (chunk) => chunks.push(chunk));
-    response.body.on("end", () => {
-      const buf = Buffer.concat(chunks);
-      if (segmentCache.size > MAX_CACHE) {
-        const firstKey = segmentCache.keys().next().value;
-        segmentCache.delete(firstKey);
+  } else {
+    try {
+      const response = await fetch(full);
+      if (!response.ok || !response.body) {
+        res.status(response.status).end();
+        return;
       }
-      segmentCache.set(url, buf);
-    });
-
-    res.setHeader("Content-Type", "video/MP2T");
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Connection", "keep-alive");
-    response.body.pipe(res);
-  } catch (err) {
-    console.error("❌ Error TS:", err.message);
-    res.status(500).send("Error al retransmitir segmento");
+      const chunks = [];
+      response.body.on("data", (chunk) => chunks.push(chunk));
+      response.body.on("end", () => {
+        const buf = Buffer.concat(chunks);
+        CACHE.set(full, buf);
+      });
+      response.body.pipe(res);
+    } catch (err) {
+      console.error("Error segmento:", err.message);
+      res.status(500).end();
+    }
   }
 });
 
 // =============================
-// 🚀 Servidor HTTP
+// 🚀 Servidor
 // =============================
 const server = http.createServer(app);
-server.keepAliveTimeout = 70 * 1000;
-server.headersTimeout = 75 * 1000;
-server.listen(PORT, () => console.log(`✅ Proxy TV activo en puerto ${PORT}`));
+server.keepAliveTimeout = 120 * 1000;
+server.headersTimeout = 125 * 1000;
+
+server.listen(PORT, () => console.log(`✅ Proxy estable con buffer extendido en ${PORT}`));
