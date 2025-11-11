@@ -1,7 +1,6 @@
 import fs from "fs";
 import path from "path";
 import express from "express";
-import fetch from "node-fetch";
 import events from "events";
 events.EventEmitter.defaultMaxListeners = 1000000;
 
@@ -105,8 +104,10 @@ async function checkLive(channel) {
   const url = channels[channel]?.live;
   if (!url) return false;
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 2000);
   try {
-    const response = await fetch(url, { headers: { Range: "bytes=0-200" }, timeout: 2000 });
+    const response = await fetch(url, { headers: { Range: "bytes=0-200" }, signal: controller.signal });
     const text = await response.text();
     const ok = response.ok && text.includes(".ts");
     channelStatus[channel].live = ok;
@@ -115,6 +116,8 @@ async function checkLive(channel) {
   } catch {
     channelStatus[channel].live = false;
     return false;
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -150,6 +153,7 @@ app.post("/api/channels", (req, res) => {
 // 🎛️ PROXY DE PLAYLIST
 // =============================
 const CACHE_TTL = 10000;
+const PRELOAD_SEGMENTS = 3;
 
 app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
   const { channel } = req.params;
@@ -165,6 +169,7 @@ app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
     const response = await fetch(playlistUrl);
     let text = await response.text();
 
+    // Reescribir rutas TS
     text = text.replace(/^(?!#)(.*\.ts.*)$/gm, (line) => {
       if (line.startsWith("http")) return line + `?v=${Date.now()}`;
       return `/proxy/${channel}/${line}?v=${Date.now()}`;
@@ -176,7 +181,6 @@ app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
   } catch (err) {
     const cache = PLAYLIST_CACHE[channel];
     if (Date.now() - cache.timestamp < CACHE_TTL) {
-      console.warn(`⚠️ Error en ${channel}: ${err.message}, usando cache`);
       res.header("Content-Type", "application/vnd.apple.mpegurl");
       res.send(cache.data);
     } else {
@@ -188,8 +192,6 @@ app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
 // =============================
 // 🎞️ PROXY DE SEGMENTOS TS CON BUFFER Y PRELOAD
 // =============================
-const PRELOAD_SEGMENTS = 3;
-
 app.get("/proxy/:channel/:segment", async (req, res) => {
   const { channel, segment } = req.params;
   const config = channels[channel];
@@ -201,8 +203,7 @@ app.get("/proxy/:channel/:segment", async (req, res) => {
   if (!isLive) isLive = await checkLive(channel);
 
   const baseUrl = isLive ? config.live : config.cloud;
-  const urlObj = new URL(baseUrl);
-  urlObj.pathname = urlObj.pathname.substring(0, urlObj.pathname.lastIndexOf("/") + 1);
+  const baseDir = baseUrl.substring(0, baseUrl.lastIndexOf("/") + 1);
 
   // Servir desde cache si existe
   if (SEGMENT_CACHE[channel][segment]) {
@@ -211,13 +212,13 @@ app.get("/proxy/:channel/:segment", async (req, res) => {
     res.setHeader("Content-Length", cached.data.length);
     res.setHeader("Accept-Ranges", "bytes");
     res.send(cached.data);
-    // Preload siguiente segmentos
-    preloadSegments(channel, urlObj.toString(), segment);
+
+    preloadSegments(channel, baseDir, segment);
     return;
   }
 
   try {
-    const segmentUrl = `${urlObj.toString()}${segment}`;
+    const segmentUrl = `${baseDir}${segment}`;
     const response = await fetch(segmentUrl, { headers: { Range: req.headers.range || "" } });
     if (!response.ok) return res.status(response.status).end();
 
@@ -229,8 +230,7 @@ app.get("/proxy/:channel/:segment", async (req, res) => {
     res.setHeader("Accept-Ranges", "bytes");
     res.send(buffer);
 
-    // Preload siguiente segmentos
-    preloadSegments(channel, urlObj.toString(), segment);
+    preloadSegments(channel, baseDir, segment);
   } catch (err) {
     console.error("❌ Error proxy TS:", err.message);
     res.status(500).send("Error al retransmitir segmento");
@@ -238,15 +238,15 @@ app.get("/proxy/:channel/:segment", async (req, res) => {
 });
 
 // =============================
-// Función para preload de próximos segmentos
+// Función preload
 // =============================
 async function preloadSegments(channel, baseDir, currentSegment) {
-  const match = currentSegment.match(/(\d+)\.ts$/);
+  const match = currentSegment.match(/(\d+)\.ts/);
   if (!match) return;
   let index = parseInt(match[1]);
   for (let i = 1; i <= PRELOAD_SEGMENTS; i++) {
     const nextIndex = index + i;
-    const nextSegment = currentSegment.replace(/\d+\.ts$/, `${nextIndex}.ts`);
+    const nextSegment = currentSegment.replace(/\d+\.ts/, `${nextIndex}.ts`);
     if (SEGMENT_CACHE[channel][nextSegment]) continue;
     const url = `${baseDir}${nextSegment}`;
     fetch(url)
