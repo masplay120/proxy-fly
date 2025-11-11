@@ -10,32 +10,20 @@ const streamPipeline = promisify(pipeline);
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// =============================
-// 📦 CONFIGURACIÓN DE CANALES
-// =============================
 const CHANNELS_PATH = path.join(process.cwd(), "channels.json");
 let channels = {};
 
 try {
   channels = JSON.parse(fs.readFileSync(CHANNELS_PATH, "utf8"));
 } catch (e) {
-  console.error("❌ Error al cargar channels.json:", e.message);
-  channels = {};
+  console.error("Error al cargar channels.json:", e.message);
 }
 
-// =============================
-// 🌍 CORS
-// =============================
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET,HEAD,OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Range");
   next();
 });
 
-// =============================
-// 🧠 CHECK LIVE
-// =============================
 async function checkLive(url) {
   try {
     const res = await fetch(url, { method: "HEAD", timeout: 2000 });
@@ -45,9 +33,6 @@ async function checkLive(url) {
   }
 }
 
-// =============================
-// 🎛️ PROXY PLAYLIST
-// =============================
 app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
   const { channel } = req.params;
   const config = channels[channel];
@@ -59,24 +44,14 @@ app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
   try {
     const response = await fetch(playlistUrl);
     let text = await response.text();
-
-    // Reescribe las rutas de los segmentos .ts
-    text = text.replace(/^(?!#)(.*\.ts.*)$/gm, (line) => {
-      if (line.startsWith("http")) return `/proxy/${channel}/${line}`;
-      return `/proxy/${channel}/${line}`;
-    });
-
+    text = text.replace(/^(?!#)(.*\.ts.*)$/gm, (line) => `/proxy/${channel}/${line}`);
     res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
     res.send(text);
   } catch (err) {
-    console.error(`❌ Error al cargar playlist de ${channel}:`, err.message);
     res.status(500).send("Error al cargar playlist");
   }
 });
 
-// =============================
-// 🎞️ PROXY SEGMENTOS .ts
-// =============================
 app.get("/proxy/:channel/*", async (req, res) => {
   const { channel } = req.params;
   const segment = req.params[0];
@@ -88,30 +63,13 @@ app.get("/proxy/:channel/*", async (req, res) => {
   const segmentUrl = new URL(segment, baseUrl).href;
 
   try {
-    const response = await fetch(segmentUrl, { headers: { Range: req.headers.range || "" } });
-    if (!response.ok || !response.body) {
-      res.status(response.status).end();
-      return;
-    }
-
+    const response = await fetch(segmentUrl);
+    if (!response.ok || !response.body) return res.status(response.status).end();
     res.setHeader("Content-Type", "video/MP2T");
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Accept-Ranges", "bytes");
-
     await streamPipeline(response.body, res);
-  } catch (err) {
-    console.error(`❌ Error en segmento ${channel}:`, err.message);
+  } catch {
     res.status(500).send("Error en retransmisión");
   }
 });
 
-// =============================
-// 🚀 SERVIDOR
-// =============================
-const server = http.createServer(app);
-server.keepAliveTimeout = 75 * 1000;
-server.headersTimeout = 80 * 1000;
-
-server.listen(PORT, () => {
-  console.log(`✅ Proxy TV estable activo en puerto ${PORT}`);
-});
+http.createServer(app).listen(PORT, () => console.log(`Proxy activo en puerto ${PORT}`));
