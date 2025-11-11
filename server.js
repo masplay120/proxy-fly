@@ -64,6 +64,7 @@ function registrarConexion(canal, req) {
   conexionesActivas[canal][key] = { dispositivo, ultimaVez: Date.now() };
 }
 
+// Limpieza periódica de conexiones y cache de segmentos
 setInterval(() => {
   const ahora = Date.now();
   for (const canal in conexionesActivas) {
@@ -74,7 +75,6 @@ setInterval(() => {
     }
   }
 
-  // Limpiar segmentos viejos
   const SEGMENT_TTL = 60000; // 60s
   for (const ch in SEGMENT_CACHE) {
     for (const seg in SEGMENT_CACHE[ch]) {
@@ -169,7 +169,6 @@ app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
     const response = await fetch(playlistUrl);
     let text = await response.text();
 
-    // Reescribir rutas TS
     text = text.replace(/^(?!#)(.*\.ts.*)$/gm, (line) => {
       if (line.startsWith("http")) return line + `?v=${Date.now()}`;
       return `/proxy/${channel}/${line}?v=${Date.now()}`;
@@ -205,14 +204,13 @@ app.get("/proxy/:channel/:segment", async (req, res) => {
   const baseUrl = isLive ? config.live : config.cloud;
   const baseDir = baseUrl.substring(0, baseUrl.lastIndexOf("/") + 1);
 
-  // Servir desde cache si existe
+  // Cache
   if (SEGMENT_CACHE[channel][segment]) {
     const cached = SEGMENT_CACHE[channel][segment];
     res.setHeader("Content-Type", "video/mp2t");
     res.setHeader("Content-Length", cached.data.length);
     res.setHeader("Accept-Ranges", "bytes");
     res.send(cached.data);
-
     preloadSegments(channel, baseDir, segment);
     return;
   }
@@ -244,10 +242,12 @@ async function preloadSegments(channel, baseDir, currentSegment) {
   const match = currentSegment.match(/(\d+)\.ts/);
   if (!match) return;
   let index = parseInt(match[1]);
+
   for (let i = 1; i <= PRELOAD_SEGMENTS; i++) {
     const nextIndex = index + i;
     const nextSegment = currentSegment.replace(/\d+\.ts/, `${nextIndex}.ts`);
     if (SEGMENT_CACHE[channel][nextSegment]) continue;
+
     const url = `${baseDir}${nextSegment}`;
     fetch(url)
       .then(res => res.arrayBuffer())
