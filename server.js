@@ -1,7 +1,10 @@
 import fs from "fs";
 import path from "path";
 import express from "express";
+import fetch from "node-fetch";
+import { createProxyMiddleware } from "http-proxy-middleware";
 import events from "events";
+
 events.EventEmitter.defaultMaxListeners = 1000000;
 
 const app = express();
@@ -31,10 +34,10 @@ app.use("/admin", (req, res, next) => {
 const CHANNELS_PATH = path.join(process.cwd(), "channels.json");
 let channels = JSON.parse(fs.readFileSync(CHANNELS_PATH, "utf8"));
 
+// Inicializa objetos por canal
 const channelStatus = {};
 const PLAYLIST_CACHE = {};
 const SEGMENT_CACHE = {}; // { canal: { segmento: { data: Buffer, timestamp } } }
-
 for (const ch in channels) {
   channelStatus[ch] = { live: false, lastCheck: 0 };
   PLAYLIST_CACHE[ch] = { data: "#EXTM3U\n", timestamp: 0 };
@@ -44,8 +47,8 @@ for (const ch in channels) {
 // =============================
 // 👥 CONEXIONES ACTIVAS
 // =============================
-const conexionesActivas = {};
-const TTL = 30000;
+const conexionesActivas = {}; // { canal: { "ip|ua": { dispositivo, ultimaVez } } }
+const TTL = 30000; // 30s de timeout por usuario
 
 function detectarDispositivo(userAgent) {
   userAgent = userAgent.toLowerCase();
@@ -65,7 +68,7 @@ function registrarConexion(canal, req) {
 }
 
 // Limpieza periódica de conexiones y cache de segmentos
-setInterval(() => {
+function limpiarConexiones() {
   const ahora = Date.now();
   for (const canal in conexionesActivas) {
     for (const key in conexionesActivas[canal]) {
@@ -75,7 +78,7 @@ setInterval(() => {
     }
   }
 
-  const SEGMENT_TTL = 60000; // 60s
+  const SEGMENT_TTL = 30000; // 30s
   for (const ch in SEGMENT_CACHE) {
     for (const seg in SEGMENT_CACHE[ch]) {
       if (Date.now() - SEGMENT_CACHE[ch][seg].timestamp > SEGMENT_TTL) {
@@ -83,7 +86,8 @@ setInterval(() => {
       }
     }
   }
-}, 10000);
+}
+setInterval(limpiarConexiones, 10000);
 
 function obtenerEstadoCanal(canal) {
   const usuarios = conexionesActivas[canal] || {};
@@ -97,27 +101,32 @@ function obtenerEstadoCanal(canal) {
 }
 
 // =============================
-// 🧠 CHECK LIVE
+// 🧠 FUNCION CHECK LIVE CACHEADO
 // =============================
 async function checkLive(channel) {
-  if (!channelStatus[channel]) channelStatus[channel] = { live: false, lastCheck: 0 };
+  const now = Date.now();
+  const lastCheck = channelStatus[channel]?.lastCheck || 0;
+  if (now - lastCheck < 5000) return channelStatus[channel].live;
+
   const url = channels[channel]?.live;
   if (!url) return false;
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 2000);
   try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1000);
+
     const response = await fetch(url, { headers: { Range: "bytes=0-200" }, signal: controller.signal });
     const text = await response.text();
     const ok = response.ok && text.includes(".ts");
+
     channelStatus[channel].live = ok;
-    channelStatus[channel].lastCheck = Date.now();
+    channelStatus[channel].lastCheck = now;
+
+    clearTimeout(timeout);
     return ok;
   } catch {
     channelStatus[channel].live = false;
     return false;
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
@@ -152,8 +161,7 @@ app.post("/api/channels", (req, res) => {
 // =============================
 // 🎛️ PROXY DE PLAYLIST
 // =============================
-const CACHE_TTL = 10000;
-const PRELOAD_SEGMENTS = 3;
+const CACHE_TTL = 10000; // 10s
 
 app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
   const { channel } = req.params;
@@ -189,10 +197,12 @@ app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
 });
 
 // =============================
-// 🎞️ PROXY DE SEGMENTOS TS CON BUFFER Y PRELOAD
+// 🎞️ PROXY DE SEGMENTOS TS CON CACHE Y PRELOAD
 // =============================
-app.get("/proxy/:channel/:segment", async (req, res) => {
-  const { channel, segment } = req.params;
+const PRELOAD_SEGMENTS = 3;
+
+app.use("/proxy/:channel/", async (req, res, next) => {
+  const { channel } = req.params;
   const config = channels[channel];
   if (!config) return res.status(404).send("Canal no encontrado");
 
@@ -202,56 +212,62 @@ app.get("/proxy/:channel/:segment", async (req, res) => {
   if (!isLive) isLive = await checkLive(channel);
 
   const baseUrl = isLive ? config.live : config.cloud;
-  const baseDir = baseUrl.substring(0, baseUrl.lastIndexOf("/") + 1);
+  const urlObj = new URL(baseUrl);
+  urlObj.pathname = urlObj.pathname.substring(0, urlObj.pathname.lastIndexOf("/") + 1);
+  const baseDir = urlObj.toString();
 
-  // Cache
-  if (SEGMENT_CACHE[channel][segment]) {
-    const cached = SEGMENT_CACHE[channel][segment];
+  // Cache de segmentos
+  const key = req.path.replace(`/proxy/${channel}/`, "");
+  if (SEGMENT_CACHE[channel]?.[key]) {
+    const cached = SEGMENT_CACHE[channel][key];
     res.setHeader("Content-Type", "video/mp2t");
     res.setHeader("Content-Length", cached.data.length);
     res.setHeader("Accept-Ranges", "bytes");
     res.send(cached.data);
-    preloadSegments(channel, baseDir, segment);
+    preloadSegments(channel, baseDir, key);
     return;
   }
 
-  try {
-    const segmentUrl = `${baseDir}${segment}`;
-    const response = await fetch(segmentUrl, { headers: { Range: req.headers.range || "" } });
-    if (!response.ok) return res.status(response.status).end();
+  return createProxyMiddleware({
+    target: baseDir,
+    changeOrigin: true,
+    pathRewrite: { [`^/proxy/${channel}/`]: "" },
+    selfHandleResponse: true,
+    onProxyRes: async (proxyRes, req, res) => {
+      const chunks = [];
+      proxyRes.on("data", (chunk) => chunks.push(chunk));
+      proxyRes.on("end", () => {
+        const buffer = Buffer.concat(chunks);
+        if (!SEGMENT_CACHE[channel]) SEGMENT_CACHE[channel] = {};
+        SEGMENT_CACHE[channel][key] = { data: buffer, timestamp: Date.now() };
+        res.setHeader("Content-Type", "video/mp2t");
+        res.setHeader("Content-Length", buffer.length);
+        res.setHeader("Accept-Ranges", "bytes");
+        res.send(buffer);
 
-    const buffer = Buffer.from(await response.arrayBuffer());
-    SEGMENT_CACHE[channel][segment] = { data: buffer, timestamp: Date.now() };
-
-    res.setHeader("Content-Type", "video/mp2t");
-    res.setHeader("Content-Length", buffer.length);
-    res.setHeader("Accept-Ranges", "bytes");
-    res.send(buffer);
-
-    preloadSegments(channel, baseDir, segment);
-  } catch (err) {
-    console.error("❌ Error proxy TS:", err.message);
-    res.status(500).send("Error al retransmitir segmento");
-  }
+        preloadSegments(channel, baseDir, key);
+      });
+    }
+  })(req, res, next);
 });
 
 // =============================
 // Función preload
 // =============================
 async function preloadSegments(channel, baseDir, currentSegment) {
-  const match = currentSegment.match(/(\d+)\.ts/);
+  const match = currentSegment.match(/(\d+)\.ts$/);
   if (!match) return;
   let index = parseInt(match[1]);
 
   for (let i = 1; i <= PRELOAD_SEGMENTS; i++) {
-    const nextIndex = index + i;
-    const nextSegment = currentSegment.replace(/\d+\.ts/, `${nextIndex}.ts`);
-    if (SEGMENT_CACHE[channel][nextSegment]) continue;
+    const nextSegment = currentSegment.replace(/\d+\.ts$/, `${index + i}.ts`);
+    if (SEGMENT_CACHE[channel]?.[nextSegment]) continue;
 
     const url = `${baseDir}${nextSegment}`;
     fetch(url)
-      .then(res => res.arrayBuffer())
+      .then(r => r.arrayBuffer())
       .then(buffer => {
+        if (!SEGMENT_CACHE[channel]) SEGMENT_CACHE[channel] = {};
         SEGMENT_CACHE[channel][nextSegment] = { data: Buffer.from(buffer), timestamp: Date.now() };
       })
       .catch(err => console.warn(`❌ Preload segmento ${nextSegment} error: ${err.message}`));
