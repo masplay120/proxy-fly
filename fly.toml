@@ -6,6 +6,7 @@ primary_region = "gru"
 
 [env]
   PORT = "8080"
+  NODE_ENV = "production"
   ADMIN_USER = "admin"
   ADMIN_PASS = "1234"
 
@@ -20,3 +21,14 @@ primary_region = "gru"
   [[services.ports]]
     handlers = ["tls", "http"]
     port = 443
+
+  [[services.tcp_checks]]
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "10s"
+    restart_limit = 2
+
+  [[services.concurrency]]
+    type = "connections"
+    soft_limit = 50
+    hard_limit = 100
