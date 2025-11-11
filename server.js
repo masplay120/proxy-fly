@@ -1,155 +1,224 @@
 import fs from "fs";
 import path from "path";
-import http from "http";
+import express from "express";
 import fetch from "node-fetch";
+import http from "http";
 import { pipeline } from "stream";
 import { promisify } from "util";
-
+import pLimit from "p-limit";
 const streamPipeline = promisify(pipeline);
+
+const app = express();
 const PORT = process.env.PORT || 8080;
+app.use(express.json());
 
-// ==============================
-// 📂 CARGAR CANALES DESDE JSON
-// ==============================
-const CHANNELS_PATH = path.join(process.cwd(), "channels.json");
-if (!fs.existsSync(CHANNELS_PATH)) {
-  console.error("❌ No se encontró channels.json");
-  process.exit(1);
-}
+// =============================
+// 🔐 PANEL ADMIN (opcional)
+// =============================
+const ADMIN_USER = process.env.ADMIN_USER || "";
+const ADMIN_PASS = process.env.ADMIN_PASS || "";
 
-let channels = JSON.parse(fs.readFileSync(CHANNELS_PATH, "utf8"));
-console.log(`✅ ${Object.keys(channels).length} canales cargados`);
-
-// ==============================
-// ⚙️ CONFIGURACIÓN
-// ==============================
-const CACHE_TTL = 15000; // 15s para playlist
-const FETCH_TIMEOUT_MS = 10000; // 10s timeout fetch
-const cache = {};
-
-// ==============================
-// 🧠 FUNCIONES AUXILIARES
-// ==============================
-async function fetchConTimeout(url, options = {}, timeout = FETCH_TIMEOUT_MS) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout);
-  try {
-    const res = await fetch(url, { ...options, signal: controller.signal });
-    clearTimeout(timer);
-    return res;
-  } catch (err) {
-    clearTimeout(timer);
-    throw err;
+app.use("/admin", (req, res, next) => {
+  const authHeader = req.headers.authorization || "";
+  const [type, credentials] = authHeader.split(" ");
+  if (type === "Basic" && credentials) {
+    const [user, pass] = Buffer.from(credentials, "base64").toString().split(":");
+    if (user === ADMIN_USER && pass === ADMIN_PASS) return next();
   }
+  res.set("WWW-Authenticate", 'Basic realm="Panel Admin"');
+  res.status(401).send("Acceso denegado");
+});
+
+// =============================
+// 📡 CARGA DE CANALES
+// =============================
+const CHANNELS_PATH = path.join(process.cwd(), "channels.json");
+let channels = JSON.parse(fs.readFileSync(CHANNELS_PATH, "utf8"));
+
+const channelStatus = {};
+const PLAYLIST_CACHE = {};
+for (const ch in channels) {
+  channelStatus[ch] = { live: false, lastCheck: 0 };
+  PLAYLIST_CACHE[ch] = { data: "#EXTM3U\n", timestamp: 0 };
 }
 
-// Verifica si un canal está en vivo
+// =============================
+// 🌍 CORS
+// =============================
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET,HEAD,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Range");
+  next();
+});
+
+// =============================
+// 🧠 FUNCIONES AUXILIARES
+// =============================
+
+const limit = pLimit(10); // Máximo 10 fetch simultáneos
+
+function fetchConTimeout(url, options = {}, timeout = 10000) {
+  return new Promise((resolve, reject) => {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeout);
+    fetch(url, { ...options, signal: controller.signal })
+      .then(resolve)
+      .catch(reject)
+      .finally(() => clearTimeout(id));
+  });
+}
+
+async function fetchConLimite(url, options = {}, timeout = 10000) {
+  return limit(() => fetchConTimeout(url, options, timeout));
+}
+
 async function checkLive(channel) {
-  const config = channels[channel];
-  if (!config?.live) return false;
+  if (!channelStatus[channel]) channelStatus[channel] = { live: false, lastCheck: 0 };
+  const url = channels[channel]?.live;
+  if (!url) return false;
+
   try {
-    const response = await fetch(config.live, { timeout: 2000 });
-    return response.ok;
+    const response = await fetchConLimite(url, { headers: { Range: "bytes=0-200" } }, 3000);
+    const text = await response.text();
+    const ok = response.ok && text.includes(".ts");
+    channelStatus[channel].live = ok;
+    channelStatus[channel].lastCheck = Date.now();
+    return ok;
   } catch {
+    channelStatus[channel].live = false;
     return false;
   }
 }
 
-// ==============================
-// 🚀 SERVIDOR HTTP
-// ==============================
-const server = http.createServer(async (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Range");
-  if (req.method === "OPTIONS") return res.end();
+// =============================
+// 🧰 PANEL ADMIN
+// =============================
+app.use("/admin", express.static("admin"));
 
-  const parts = req.url.split("/").filter(Boolean);
-  if (parts[0] !== "proxy") {
-    res.writeHead(404);
-    return res.end("Ruta no válida");
+app.get("/api/channels", (req, res) => res.json(channels));
+
+app.post("/api/channels", (req, res) => {
+  channels = req.body;
+  fs.writeFileSync(CHANNELS_PATH, JSON.stringify(channels, null, 2));
+  for (const ch in channels) {
+    if (!channelStatus[ch]) channelStatus[ch] = { live: false, lastCheck: 0 };
+    if (!PLAYLIST_CACHE[ch]) PLAYLIST_CACHE[ch] = { data: "#EXTM3U\n", timestamp: 0 };
   }
+  res.json({ message: "Canales actualizados correctamente" });
+});
 
-  const canal = parts[1];
-  const archivo = parts.slice(2).join("/");
-  const config = channels[canal];
-  if (!config) {
-    res.writeHead(404);
-    return res.end("Canal no encontrado");
-  }
+// =============================
+// 🎛️ PROXY DE PLAYLIST
+// =============================
+const CACHE_TTL = 10000; // 10s cache playlist
 
-  // Detectar URL base
-  const liveDisponible = await checkLive(canal);
-  const baseUrl = liveDisponible ? config.live : config.cloud;
+app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
+  const { channel } = req.params;
+  const config = channels[channel];
+  if (!config) return res.status(404).send("Canal no encontrado");
 
-  if (!archivo) {
-    // Solicitud del playlist principal
-    try {
-      const playlistRes = await fetchConTimeout(baseUrl);
-      const text = await playlistRes.text();
-
-      // Reescribir las rutas internas para pasar por el proxy
-      const baseDir = baseUrl.substring(0, baseUrl.lastIndexOf("/") + 1);
-      const modified = text.replace(/^(?!#)(.*\.ts.*)$/gm, (line) => {
-        const url = line.startsWith("http") ? line : baseDir + line;
-        return `/proxy/${canal}/${url.replace(baseDir, "")}?v=${Date.now()}`;
-      });
-
-      cache[canal] = { data: modified, time: Date.now() };
-      res.writeHead(200, { "Content-Type": "application/vnd.apple.mpegurl" });
-      res.end(modified);
-    } catch (err) {
-      console.warn("⚠️ Playlist error:", err.message);
-      const cached = cache[canal];
-      if (cached && Date.now() - cached.time < CACHE_TTL) {
-        res.writeHead(200, { "Content-Type": "application/vnd.apple.mpegurl" });
-        res.end(cached.data);
-      } else {
-        res.writeHead(502);
-        res.end("Error cargando playlist");
-      }
-    }
-    return;
-  }
-
-  // Segmentos .ts o sublistas
-  const baseDir = baseUrl.substring(0, baseUrl.lastIndexOf("/") + 1);
-  const targetUrl = archivo.startsWith("http") ? archivo : baseDir + archivo;
+  const isLive = await checkLive(channel);
+  const playlistUrl = isLive ? config.live : config.cloud;
 
   try {
-    const resp = await fetchConTimeout(targetUrl, {
-      headers: { Range: req.headers.range || "" },
+    const response = await fetchConLimite(playlistUrl);
+    let text = await response.text();
+
+    // Reescribir URLs .ts
+    text = text.replace(/^(?!#)(.*\.ts.*)$/gm, (line) => {
+      if (line.startsWith("http")) return line + `?v=${Date.now()}`;
+      return `/proxy/${channel}/${line}?v=${Date.now()}`;
     });
 
-    if (!resp.ok) {
-      res.writeHead(resp.status);
-      return res.end(`Error origen: ${resp.status}`);
-    }
-
-    res.setHeader("Content-Type", resp.headers.get("content-type") || "application/octet-stream");
-    res.setHeader("Accept-Ranges", "bytes");
-    await streamPipeline(resp.body, res);
+    PLAYLIST_CACHE[channel] = { data: text, timestamp: Date.now() };
+    res.header("Content-Type", "application/vnd.apple.mpegurl");
+    res.send(text);
   } catch (err) {
-    console.error("Error al enviar segmento:", err.message);
-    res.writeHead(502);
-    res.end("Error al conectar con el origen");
+    const cache = PLAYLIST_CACHE[channel];
+    if (Date.now() - cache.timestamp < CACHE_TTL) {
+      res.header("Content-Type", "application/vnd.apple.mpegurl");
+      res.send(cache.data);
+    } else {
+      console.error("⚠️ Playlist error:", err.message);
+      res.status(500).send("Error al cargar playlist");
+    }
   }
 });
 
-// ==============================
-// 🕓 MANTENER ACTIVO EN FLY.IO
-// ==============================
-setInterval(() => {
-  const canalPing = Object.keys(channels)[0];
-  if (canalPing) {
-    fetch(`http://localhost:${PORT}/proxy/${canalPing}`).catch(() => {});
-  }
-}, 4500000);
+// =============================
+// 🎞️ PROXY DE SEGMENTOS (streaming directo)
+// =============================
+app.get("/proxy/:channel/*", async (req, res) => {
+  const { channel } = req.params;
+  const segment = req.params[0];
+  const config = channels[channel];
+  if (!config) return res.status(404).send("Canal no encontrado");
 
-// Ajustar timeouts largos para evitar cortes
-server.keepAliveTimeout = 12000000; // 2 min
-server.headersTimeout = 13000000; // 2 min 10s
+  let isLive = channelStatus[channel]?.live || false;
+  if (!isLive) isLive = await checkLive(channel);
+
+  const baseUrl = isLive ? config.live : config.cloud;
+  const urlObj = new URL(baseUrl);
+  urlObj.pathname = urlObj.pathname.substring(0, urlObj.pathname.lastIndexOf("/") + 1);
+  const segmentUrl = `${urlObj.toString()}${segment}`;
+
+  try {
+    const response = await fetchConLimite(segmentUrl, { headers: { Range: req.headers.range || "" } }, 15000);
+    if (!response.ok) {
+      res.status(response.status).end();
+      return;
+    }
+
+    res.setHeader("Content-Type", "video/MP2T");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Accept-Ranges", "bytes");
+
+    // 🔄 Enviar flujo directo (sin almacenar en memoria)
+    await streamPipeline(response.body, res);
+  } catch (err) {
+    console.error(`❌ Error en segmento ${segmentUrl}:`, err.message);
+    res.status(500).send("Error al retransmitir segmento");
+  }
+});
+
+// =============================
+// 📊 ESTADO DEL CANAL
+// =============================
+app.get("/status/:channel", (req, res) => {
+  const { channel } = req.params;
+  if (!channels[channel]) return res.status(404).json({ error: "Canal no encontrado" });
+
+  res.json({
+    live: channelStatus[channel]?.live || false,
+    actualizado: new Date(channelStatus[channel]?.lastCheck || 0).toISOString(),
+  });
+});
+
+// =============================
+// ⚙️ MANTENER VIVA INSTANCIA (Fly.io)
+// =============================
+if (process.env.FLY_APP_NAME) {
+  setInterval(() => console.log("⏱️ Manteniendo instancia activa..."), 60000);
+}
+
+// =============================
+// 🚀 SERVIDOR HTTP ESTABLE
+// =============================
+const server = http.createServer(app);
+server.keepAliveTimeout = 70 * 1000;
+server.headersTimeout = 75 * 1000;
 
 server.listen(PORT, () => {
-  console.log(`🚀 Proxy fluido activo en http://localhost:${PORT}`);
+  console.log(`✅ Proxy TV activo en puerto ${PORT}`);
+});
+
+// =============================
+// 🧯 PROTECCIÓN ANTI-REINICIO
+// =============================
+process.on("uncaughtException", (err) => {
+  console.error("❌ Excepción no controlada:", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("⚠️ Promesa rechazada sin catch:", reason);
 });
