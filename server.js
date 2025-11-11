@@ -24,7 +24,7 @@ try {
 }
 
 // =============================
-// 🌍 CORS + HEADERS
+// 🌍 CORS
 // =============================
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
@@ -34,7 +34,7 @@ app.use((req, res, next) => {
 });
 
 // =============================
-// 🧠 FUNCIONES AUXILIARES
+// 🧠 CHECK LIVE
 // =============================
 async function checkLive(url) {
   try {
@@ -46,7 +46,7 @@ async function checkLive(url) {
 }
 
 // =============================
-// 🎛️ PROXY DE PLAYLIST (.m3u8)
+// 🎛️ PROXY PLAYLIST
 // =============================
 app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
   const { channel } = req.params;
@@ -60,7 +60,7 @@ app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
     const response = await fetch(playlistUrl);
     let text = await response.text();
 
-    // Reescribir rutas .ts para pasar por el proxy
+    // Reescribe las rutas de los segmentos .ts
     text = text.replace(/^(?!#)(.*\.ts.*)$/gm, (line) => {
       if (line.startsWith("http")) return `/proxy/${channel}/${line}`;
       return `/proxy/${channel}/${line}`;
@@ -75,7 +75,7 @@ app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
 });
 
 // =============================
-// 🎞️ PROXY DE SEGMENTOS (.ts)
+// 🎞️ PROXY SEGMENTOS .ts
 // =============================
 app.get("/proxy/:channel/*", async (req, res) => {
   const { channel } = req.params;
@@ -98,7 +98,6 @@ app.get("/proxy/:channel/*", async (req, res) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Accept-Ranges", "bytes");
 
-    // Transmitir directamente al cliente sin guardar en memoria
     await streamPipeline(response.body, res);
   } catch (err) {
     console.error(`❌ Error en segmento ${channel}:`, err.message);
@@ -107,10 +106,10 @@ app.get("/proxy/:channel/*", async (req, res) => {
 });
 
 // =============================
-// 🚀 SERVIDOR HTTP ESTABLE
+// 🚀 SERVIDOR
 // =============================
 const server = http.createServer(app);
-server.keepAliveTimeout = 75 * 1000; // conexiones persistentes
+server.keepAliveTimeout = 75 * 1000;
 server.headersTimeout = 80 * 1000;
 
 server.listen(PORT, () => {
