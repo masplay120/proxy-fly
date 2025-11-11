@@ -8,7 +8,7 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 // =============================
-// 📡 CONFIGURACIÓN DE CANALES
+// 📡 CARGAR CANALES
 // =============================
 const CHANNELS_PATH = path.join(process.cwd(), "channels.json");
 let channels = JSON.parse(fs.readFileSync(CHANNELS_PATH, "utf8"));
@@ -24,7 +24,7 @@ app.use((req, res, next) => {
 });
 
 // =============================
-// ⚙️ CABECERAS COMUNES PARA STREAMING
+// ⚙️ CABECERAS FALSAS (anti-bloqueo)
 // =============================
 const STREAM_HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -34,15 +34,15 @@ const STREAM_HEADERS = {
 };
 
 // =============================
-// 🧠 CACHE DE PLAYLIST Y SEGMENTOS
+// 🧠 CACHE EN MEMORIA
 // =============================
 const PLAYLIST_CACHE = {};
 const SEGMENT_CACHE = {};
-const PLAYLIST_TTL = 8000; // 8 segundos
-const SEGMENT_TTL = 120000; // 2 minutos de buffer
+const PLAYLIST_TTL = 8000;   // 8s
+const SEGMENT_TTL = 180000;  // 3 min de buffer
 
 // =============================
-// 🧩 PLAYLIST PROXY
+// 🎵 PLAYLIST PROXY
 // =============================
 app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
   const { channel } = req.params;
@@ -53,7 +53,7 @@ app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
   const now = Date.now();
   const cache = PLAYLIST_CACHE[channel];
 
-  // Servir desde cache si aún es válido
+  // Cache válido
   if (cache && now - cache.timestamp < PLAYLIST_TTL) {
     res.header("Content-Type", "application/vnd.apple.mpegurl");
     return res.send(cache.data);
@@ -63,12 +63,12 @@ app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
     const response = await fetch(playlistUrl, { headers: STREAM_HEADERS });
     let text = await response.text();
 
-    // Reescribir rutas de .ts
+    // Reemplazar rutas .ts
     text = text.replace(/^(?!#)(.*\.ts.*)$/gm, (line) => {
-      if (line.startsWith("http")) return `/proxy/${channel}/${line}?v=${Date.now()}`;
+      if (line.startsWith("http")) return `/proxy/${channel}/${line}`;
       const base = new URL(playlistUrl);
       base.pathname = base.pathname.substring(0, base.pathname.lastIndexOf("/") + 1);
-      return `/proxy/${channel}/${base}${line}?v=${Date.now()}`;
+      return `/proxy/${channel}/${base}${line}`;
     });
 
     PLAYLIST_CACHE[channel] = { data: text, timestamp: now };
@@ -76,7 +76,7 @@ app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
     res.header("Content-Type", "application/vnd.apple.mpegurl");
     res.send(text);
   } catch (err) {
-    console.error(`❌ Error cargando playlist ${channel}:`, err.message);
+    console.error(`❌ Playlist ${channel}:`, err.message);
     if (cache) {
       res.header("Content-Type", "application/vnd.apple.mpegurl");
       res.send(cache.data);
@@ -87,7 +87,7 @@ app.get("/proxy/:channel/playlist.m3u8", async (req, res) => {
 });
 
 // =============================
-// 🎞️ SEGMENTOS .TS CON BUFFER
+// 🎞️ SEGMENTOS TS CON BUFFER
 // =============================
 app.get("/proxy/:channel/*", async (req, res) => {
   const { channel } = req.params;
@@ -100,7 +100,6 @@ app.get("/proxy/:channel/*", async (req, res) => {
   base.pathname = base.pathname.substring(0, base.pathname.lastIndexOf("/") + 1);
   const segmentUrl = `${base}${segment}`;
 
-  // Cache existente
   if (!SEGMENT_CACHE[channel]) SEGMENT_CACHE[channel] = {};
   const cached = SEGMENT_CACHE[channel][segment];
   const now = Date.now();
@@ -119,7 +118,7 @@ app.get("/proxy/:channel/*", async (req, res) => {
     res.setHeader("Content-Type", "video/MP2T");
     res.send(buffer);
   } catch (err) {
-    console.error(`⚠️ Error TS ${channel}:`, err.message);
+    console.error(`⚠️ TS ${channel}:`, err.message);
     if (cached) {
       res.setHeader("Content-Type", "video/MP2T");
       res.send(cached.buffer);
@@ -130,12 +129,12 @@ app.get("/proxy/:channel/*", async (req, res) => {
 });
 
 // =============================
-// 🚀 SERVIDOR
+// 🚀 SERVIDOR CON KEEP-ALIVE
 // =============================
 const server = http.createServer(app);
-server.keepAliveTimeout = 70 * 1000;
-server.headersTimeout = 75 * 1000;
+server.keepAliveTimeout = 80 * 1000;
+server.headersTimeout = 85 * 1000;
 
 server.listen(PORT, () => {
-  console.log(`✅ Proxy activo en puerto ${PORT}`);
+  console.log(`✅ Proxy HLS activo en puerto ${PORT}`);
 });
