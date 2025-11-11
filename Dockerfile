@@ -1,24 +1,18 @@
-# Imagen base ligera pero estable
+# Imagen base ligera
 FROM node:18-alpine
 
-# Agregar librerías de compatibilidad necesarias para node-fetch y streaming
-RUN apk add --no-cache libc6-compat
-
-# Directorio de trabajo
+# Crear directorio
 WORKDIR /app
 
-# Copiar archivos de dependencias primero (mejora cache de Docker)
+# Copiar dependencias
 COPY package*.json ./
-
-# Instalar solo dependencias necesarias
 RUN npm install --production
 
-# Copiar el resto del proyecto
+# Copiar código
 COPY . .
 
-# Definir puerto de la app
-ENV PORT=8080
+# Exponer puerto
 EXPOSE 8080
 
-# Comando de inicio
+# Iniciar app
 CMD ["node", "server.js"]
