@@ -7,8 +7,6 @@ primary_region = "gru"
 [env]
   PORT = "8080"
   NODE_ENV = "production"
-  ADMIN_USER = "admin"
-  ADMIN_PASS = "1234"
 
 [[services]]
   internal_port = 8080
@@ -25,10 +23,10 @@ primary_region = "gru"
   [[services.tcp_checks]]
     interval = "15s"
     timeout = "5s"
-    grace_period = "10s"
+    grace_period = "15s"
     restart_limit = 2
 
   [[services.concurrency]]
     type = "connections"
-    soft_limit = 50
-    hard_limit = 100
+    soft_limit = 40
+    hard_limit = 80
