@@ -144,11 +144,11 @@ setInterval(() => {
   if (canalPing) {
     fetch(`http://localhost:${PORT}/proxy/${canalPing}`).catch(() => {});
   }
-}, 45000);
+}, 4500000);
 
 // Ajustar timeouts largos para evitar cortes
-server.keepAliveTimeout = 120000; // 2 min
-server.headersTimeout = 130000; // 2 min 10s
+server.keepAliveTimeout = 12000000; // 2 min
+server.headersTimeout = 13000000; // 2 min 10s
 
 server.listen(PORT, () => {
   console.log(`🚀 Proxy fluido activo en http://localhost:${PORT}`);
