@@ -100,8 +100,8 @@ app.get("/proxy/:channel/segment", async (req, res) => {
 
 // === Servidor HTTP con Keep-Alive ===
 const server = http.createServer(app);
-server.keepAliveTimeout = 120000;
-server.headersTimeout = 125000;
+server.keepAliveTimeout = 1200000;
+server.headersTimeout = 1250000;
 
 server.listen(PORT, () => {
   console.log(`✅ Proxy HLS con fallback activo en puerto ${PORT}`);
